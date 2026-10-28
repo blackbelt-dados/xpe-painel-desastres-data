@@ -1,8 +1,6 @@
 name: Coleta diaria INMET
 
 on:
-  schedule:
-    - cron: "15 8 * * *"
   workflow_dispatch:
     inputs:
       date:
@@ -41,7 +39,7 @@ jobs:
       - name: Coletar observacoes do INMET
         env:
           TARGET_DATE: ${{ github.event.inputs.date || '' }}
-          MAX_STATIONS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.max_stations || '0' }}
+          MAX_STATIONS: ${{ github.event.inputs.max_stations || '10' }}
         run: |
           args=(--max-stations "$MAX_STATIONS")
           if [[ -n "$TARGET_DATE" ]]; then

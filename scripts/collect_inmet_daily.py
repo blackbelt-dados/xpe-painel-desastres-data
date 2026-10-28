@@ -17,7 +17,10 @@ from zoneinfo import ZoneInfo
 import requests
 
 CATALOG_URL = "https://apitempo.inmet.gov.br/estacoes/T"
-OBSERVATION_URL = "https://apitempo.inmet.gov.br/estacao/{day}/{day}/{station}"
+OBSERVATION_URLS = (
+    ("hourly", "https://apitempo.inmet.gov.br/estacao/{day}/{day}/{station}"),
+    ("daily", "https://apitempo.inmet.gov.br/estacao/diaria/{day}/{day}/{station}"),
+)
 DATA_ROOT = Path("data/inmet")
 HEADERS = {
     "Accept": "application/json",
@@ -42,21 +45,38 @@ def get_json(url: str, attempts: int = 3) -> object:
     raise RuntimeError(f"Falha após {attempts} tentativas: {url}") from last_error
 
 
+def station_is_active(station: dict[str, object], target_day: date) -> bool:
+    """Exclui estações encerradas antes da data solicitada."""
+    end_value = station.get("DT_FIM_OPERACAO")
+    if end_value in (None, "", "null", "None"):
+        return True
+    try:
+        end_date = date.fromisoformat(str(end_value)[:10])
+    except ValueError:
+        return True
+    return end_date >= target_day
+
+
 def collect_station(day: date, station: dict[str, object]) -> tuple[str, list[dict[str, object]]]:
     code = str(station["CD_ESTACAO"])
-    url = OBSERVATION_URL.format(day=day.isoformat(), station=code)
-    payload = get_json(url)
-    if not isinstance(payload, list):
-        raise TypeError(f"Resposta inesperada para {code}: {type(payload).__name__}")
+    for source_kind, template in OBSERVATION_URLS:
+        url = template.format(day=day.isoformat(), station=code)
+        payload = get_json(url)
+        if not isinstance(payload, list):
+            raise TypeError(f"Resposta inesperada para {code}: {type(payload).__name__}")
+        if not payload:
+            continue
 
-    rows: list[dict[str, object]] = []
-    for item in payload:
-        if isinstance(item, dict):
-            row = dict(item)
-            row["_source_url"] = url
-            row["_collected_at_utc"] = datetime.now(timezone.utc).isoformat()
-            rows.append(row)
-    return code, rows
+        rows: list[dict[str, object]] = []
+        for item in payload:
+            if isinstance(item, dict):
+                row = dict(item)
+                row["_source_kind"] = source_kind
+                row["_source_url"] = url
+                row["_collected_at_utc"] = datetime.now(timezone.utc).isoformat()
+                rows.append(row)
+        return code, rows
+    return code, []
 
 
 def prune_old_partitions(root: Path, cutoff: date) -> list[str]:
@@ -91,11 +111,24 @@ def main() -> int:
     stations = [
         station
         for station in catalog
-        if isinstance(station, dict) and station.get("CD_ESTACAO")
+        if isinstance(station, dict)
+        and station.get("CD_ESTACAO")
+        and station_is_active(station, target_day)
     ]
     stations.sort(key=lambda item: str(item["CD_ESTACAO"]))
     if args.max_stations > 0:
         stations = stations[: args.max_stations]
+
+    print(
+        json.dumps(
+            {
+                "target_date": target_day.isoformat(),
+                "active_stations_selected": len(stations),
+                "station_codes": [str(item["CD_ESTACAO"]) for item in stations],
+            },
+            ensure_ascii=False,
+        )
+    )
 
     records: list[dict[str, object]] = []
     failures: list[dict[str, str]] = []

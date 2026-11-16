@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Coleta observações diárias das estações automáticas do INMET."""
+"""Coleta observações SYNOP do INMET pela API oficial WIS2/OGC."""
 
 from __future__ import annotations
 
@@ -9,77 +9,163 @@ import hashlib
 import json
 import shutil
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Iterator
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 import requests
 
-CATALOG_URL = "https://apitempo.inmet.gov.br/estacoes/T"
-OBSERVATION_URLS = (
-    ("hourly", "https://apitempo.inmet.gov.br/estacao/{day}/{day}/{station}"),
-    ("daily", "https://apitempo.inmet.gov.br/estacao/diaria/{day}/{day}/{station}"),
+ITEMS_URL = (
+    "https://wis2bra.inmet.gov.br/oapi/collections/"
+    "urn:wmo:md:br-inmet:synop/items"
 )
 DATA_ROOT = Path("data/inmet")
+PAGE_SIZE = 10_000
+VARIABLES = (
+    "air_temperature",
+    "relative_humidity",
+    "total_precipitation_or_total_water_equivalent",
+    "wind_speed",
+    "maximum_wind_gust_speed",
+    "pressure_reduced_to_mean_sea_level",
+)
 HEADERS = {
-    "Accept": "application/json",
-    "User-Agent": "xpe-painel-desastres/0.1 (projeto academico)",
+    "Accept": "application/geo+json, application/json",
+    "User-Agent": "xpe-painel-desastres/0.2 (projeto academico)",
 }
 
 
-def get_json(url: str, attempts: int = 3) -> object:
-    """Obtém JSON com repetição curta para erros transitórios."""
+def get_json(url: str, attempts: int = 4) -> dict[str, object]:
+    """Obtém JSON com espera exponencial para erros transitórios."""
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            response = requests.get(url, headers=HEADERS, timeout=60)
-            if response.status_code == 204:
-                return []
+            response = requests.get(url, headers=HEADERS, timeout=120)
             response.raise_for_status()
-            return response.json()
-        except (requests.RequestException, ValueError) as exc:
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise TypeError(
+                    f"Resposta inesperada: {type(payload).__name__}"
+                )
+            return payload
+        except (requests.RequestException, ValueError, TypeError) as exc:
             last_error = exc
             if attempt < attempts:
                 time.sleep(2 ** (attempt - 1))
-    raise RuntimeError(f"Falha após {attempts} tentativas: {url}") from last_error
+    raise RuntimeError(
+        f"Falha após {attempts} tentativas: {url}"
+    ) from last_error
 
 
-def station_is_active(station: dict[str, object], target_day: date) -> bool:
-    """Exclui estações encerradas antes da data solicitada."""
-    end_value = station.get("DT_FIM_OPERACAO")
-    if end_value in (None, "", "null", "None"):
-        return True
-    try:
-        end_date = date.fromisoformat(str(end_value)[:10])
-    except ValueError:
-        return True
-    return end_date >= target_day
+def first_page_url(day: date, variable: str) -> str:
+    """Monta a primeira página para uma variável e um dia UTC."""
+    next_day = day + timedelta(days=1)
+    params = {
+        "f": "json",
+        "datetime": (
+            f"{day.isoformat()}T00:00:00Z/"
+            f"{next_day.isoformat()}T00:00:00Z"
+        ),
+        "name": variable,
+        "limit": str(PAGE_SIZE),
+    }
+    return f"{ITEMS_URL}?{urlencode(params)}"
 
 
-def collect_station(day: date, station: dict[str, object]) -> tuple[str, list[dict[str, object]]]:
-    code = str(station["CD_ESTACAO"])
-    for source_kind, template in OBSERVATION_URLS:
-        url = template.format(day=day.isoformat(), station=code)
+def next_page_url(payload: dict[str, object]) -> str | None:
+    """Extrai do GeoJSON o link da próxima página, quando houver."""
+    links = payload.get("links", [])
+    if not isinstance(links, list):
+        return None
+    for link in links:
+        if (
+            isinstance(link, dict)
+            and link.get("rel") == "next"
+            and isinstance(link.get("href"), str)
+        ):
+            return str(link["href"])
+    return None
+
+
+def normalize_feature(
+    feature: dict[str, object], collected_at: str
+) -> dict[str, object]:
+    """Converte uma feature OGC em uma linha analítica compacta."""
+    properties = feature.get("properties", {})
+    geometry = feature.get("geometry", {})
+    if not isinstance(properties, dict):
+        properties = {}
+    if not isinstance(geometry, dict):
+        geometry = {}
+
+    coordinates = geometry.get("coordinates", [])
+    if not isinstance(coordinates, list):
+        coordinates = []
+
+    return {
+        "feature_id": feature.get("id") or properties.get("id"),
+        "station_wigos": properties.get("wigos_station_identifier"),
+        "report_id": properties.get("reportId"),
+        "report_time_utc": properties.get("reportTime"),
+        "phenomenon_time_utc": properties.get("phenomenonTime"),
+        "variable": properties.get("name"),
+        "value": properties.get("value"),
+        "unit": properties.get("units"),
+        "description": properties.get("description"),
+        "longitude": coordinates[0] if len(coordinates) > 0 else None,
+        "latitude": coordinates[1] if len(coordinates) > 1 else None,
+        "elevation_m": coordinates[2] if len(coordinates) > 2 else None,
+        "collected_at_utc": collected_at,
+    }
+
+
+def collect_variable(
+    day: date, variable: str, collected_at: str
+) -> Iterator[dict[str, object]]:
+    """Percorre todas as páginas de uma variável."""
+    url: str | None = first_page_url(day, variable)
+    seen_urls: set[str] = set()
+    page = 0
+
+    while url:
+        if url in seen_urls:
+            raise RuntimeError(
+                f"Ciclo de paginação detectado para {variable}: {url}"
+            )
+        seen_urls.add(url)
+        page += 1
+
         payload = get_json(url)
-        if not isinstance(payload, list):
-            raise TypeError(f"Resposta inesperada para {code}: {type(payload).__name__}")
-        if not payload:
-            continue
+        features = payload.get("features", [])
+        if not isinstance(features, list):
+            raise TypeError(
+                f"A API não retornou uma lista de features para {variable}."
+            )
 
-        rows: list[dict[str, object]] = []
-        for item in payload:
-            if isinstance(item, dict):
-                row = dict(item)
-                row["_source_kind"] = source_kind
-                row["_source_url"] = url
-                row["_collected_at_utc"] = datetime.now(timezone.utc).isoformat()
-                rows.append(row)
-        return code, rows
-    return code, []
+        print(
+            json.dumps(
+                {
+                    "variable": variable,
+                    "page": page,
+                    "number_matched": payload.get("numberMatched"),
+                    "number_returned": len(features),
+                },
+                ensure_ascii=False,
+            )
+        )
+
+        for feature in features:
+            if isinstance(feature, dict):
+                yield normalize_feature(feature, collected_at)
+
+        url = next_page_url(payload)
 
 
 def prune_old_partitions(root: Path, cutoff: date) -> list[str]:
+    """Remove partições locais anteriores à janela de retenção."""
     removed: list[str] = []
     for path in root.glob("observation_date=*"):
         if not path.is_dir():
@@ -97,98 +183,88 @@ def prune_old_partitions(root: Path, cutoff: date) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", type=date.fromisoformat)
-    parser.add_argument("--max-stations", type=int, default=0)
-    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument(
+        "--variables",
+        nargs="+",
+        choices=VARIABLES,
+        default=list(VARIABLES),
+    )
     args = parser.parse_args()
 
     sao_paulo = ZoneInfo("America/Sao_Paulo")
-    target_day = args.date or (datetime.now(sao_paulo).date() - timedelta(days=1))
-
-    catalog = get_json(CATALOG_URL)
-    if not isinstance(catalog, list):
-        raise TypeError("O catálogo do INMET não retornou uma lista.")
-
-    stations = [
-        station
-        for station in catalog
-        if isinstance(station, dict)
-        and station.get("CD_ESTACAO")
-        and station_is_active(station, target_day)
-    ]
-    stations.sort(key=lambda item: str(item["CD_ESTACAO"]))
-    if args.max_stations > 0:
-        stations = stations[: args.max_stations]
-
-    print(
-        json.dumps(
-            {
-                "target_date": target_day.isoformat(),
-                "active_stations_selected": len(stations),
-                "station_codes": [str(item["CD_ESTACAO"]) for item in stations],
-            },
-            ensure_ascii=False,
-        )
+    target_day = args.date or (
+        datetime.now(sao_paulo).date() - timedelta(days=1)
     )
+    collected_at = datetime.now(timezone.utc).isoformat()
 
-    records: list[dict[str, object]] = []
-    failures: list[dict[str, str]] = []
-    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
-        futures = {
-            executor.submit(collect_station, target_day, station): station
-            for station in stations
-        }
-        for future in as_completed(futures):
-            station = futures[future]
-            code = str(station["CD_ESTACAO"])
-            try:
-                _, rows = future.result()
-                records.extend(rows)
-            except Exception as exc:
-                failures.append({"station": code, "error": str(exc)})
+    records_by_id: dict[str, dict[str, object]] = {}
+    for variable in args.variables:
+        for row in collect_variable(target_day, variable, collected_at):
+            feature_id = str(row.get("feature_id") or "")
+            if not feature_id:
+                raise RuntimeError(
+                    f"Feature sem identificador recebida para {variable}."
+                )
+            records_by_id[feature_id] = row
 
+    records = sorted(
+        records_by_id.values(),
+        key=lambda row: (
+            str(row.get("station_wigos", "")),
+            str(row.get("report_time_utc", "")),
+            str(row.get("variable", "")),
+            str(row.get("feature_id", "")),
+        ),
+    )
     if not records:
         raise RuntimeError(
-            f"Nenhuma observação recebida para {target_day}; "
-            f"falhas={len(failures)}, estações={len(stations)}"
+            f"Nenhuma observação WIS2 recebida para {target_day}."
         )
-
-    records.sort(
-        key=lambda row: (
-            str(row.get("CD_ESTACAO", "")),
-            str(row.get("DT_MEDICAO", "")),
-            str(row.get("HR_MEDICAO", "")),
-        )
-    )
 
     partition = DATA_ROOT / f"observation_date={target_day.isoformat()}"
     partition.mkdir(parents=True, exist_ok=True)
-    data_path = partition / "inmet_automatic.jsonl.gz"
+    data_path = partition / "inmet_synop.jsonl.gz"
     with gzip.open(data_path, "wt", encoding="utf-8") as stream:
         for row in records:
             stream.write(json.dumps(row, ensure_ascii=False, sort_keys=True))
-            stream.write(chr(10))
+            stream.write("\n")
 
     checksum = hashlib.sha256(data_path.read_bytes()).hexdigest()
     cutoff = target_day - timedelta(days=89)
     removed = prune_old_partitions(DATA_ROOT, cutoff)
+    station_count = len(
+        {
+            str(row["station_wigos"])
+            for row in records
+            if row.get("station_wigos")
+        }
+    )
+    variable_counts = Counter(
+        str(row.get("variable")) for row in records
+    )
     manifest = {
         "status": "success",
-        "source": "INMET API de estações automáticas",
-        "catalog_url": CATALOG_URL,
-        "observation_date": target_day.isoformat(),
-        "collected_at_utc": datetime.now(timezone.utc).isoformat(),
-        "stations_attempted": len(stations),
-        "stations_failed": len(failures),
+        "source": "INMET WIS2 OGC API Features - SYNOP Brasil",
+        "items_url": ITEMS_URL,
+        "observation_date_utc": target_day.isoformat(),
+        "collected_at_utc": collected_at,
+        "variables": list(args.variables),
+        "variable_counts": dict(sorted(variable_counts.items())),
+        "stations": station_count,
         "records": len(records),
         "file": data_path.as_posix(),
         "bytes": data_path.stat().st_size,
         "sha256": checksum,
         "retention_days": 90,
+        "retention_cutoff": cutoff.isoformat(),
         "removed_partitions": removed,
-        "failure_sample": sorted(failures, key=lambda item: item["station"])[:20],
     }
-    manifest_text = json.dumps(manifest, ensure_ascii=False, indent=2) + chr(10)
-    (partition / "manifest.json").write_text(manifest_text, encoding="utf-8")
+    manifest_text = json.dumps(
+        manifest, ensure_ascii=False, indent=2, sort_keys=True
+    ) + "\n"
+    (partition / "manifest.json").write_text(
+        manifest_text, encoding="utf-8"
+    )
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
     return 0
 

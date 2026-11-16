@@ -1,6 +1,6 @@
 {
-  "bytes": 812027,
-  "collected_at_utc": "2026-11-16T19:47:58.868993+00:00",
+  "bytes": 812044,
+  "collected_at_utc": "2026-11-16T20:18:24.558164+00:00",
   "file": "data/inmet/observation_date=2026-11-15/inmet_synop.jsonl.gz",
   "items_url": "https://wis2bra.inmet.gov.br/oapi/collections/urn:wmo:md:br-inmet:synop/items",
   "observation_date_utc": "2026-11-15",
@@ -8,7 +8,7 @@
   "removed_partitions": [],
   "retention_cutoff": "2026-08-18",
   "retention_days": 90,
-  "sha256": "1360d4c7d98c95d41bcd3e2061d35640980a70dd6ab5224039ddefaf6ab80666",
+  "sha256": "91112da60525a16b085ea1d0f2490b7f3a176292ab46d96d40d99897a7b025dd",
   "source": "INMET WIS2 OGC API Features - SYNOP Brasil",
   "stations": 530,
   "status": "success",

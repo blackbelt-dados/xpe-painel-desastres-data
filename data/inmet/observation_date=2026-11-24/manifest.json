@@ -1,0 +1,31 @@
+{
+  "bytes": 132768,
+  "collected_at_utc": "2026-11-25T19:15:46.588445+00:00",
+  "file": "data/inmet/observation_date=2026-11-24/inmet_synop.jsonl.gz",
+  "items_url": "https://wis2bra.inmet.gov.br/oapi/collections/urn:wmo:md:br-inmet:synop/items",
+  "observation_date_utc": "2026-11-24",
+  "records": 9084,
+  "removed_partitions": [],
+  "retention_cutoff": "2026-08-27",
+  "retention_days": 90,
+  "sha256": "753ba93c42fd1504ce95be3197757dfe28a7387bd86859eab990c49f6e1051eb",
+  "source": "INMET WIS2 OGC API Features - SYNOP Brasil",
+  "stations": 511,
+  "status": "success",
+  "variable_counts": {
+    "air_temperature": 1814,
+    "maximum_wind_gust_speed": 1537,
+    "pressure_reduced_to_mean_sea_level": 873,
+    "relative_humidity": 1640,
+    "total_precipitation_or_total_water_equivalent": 1608,
+    "wind_speed": 1612
+  },
+  "variables": [
+    "air_temperature",
+    "relative_humidity",
+    "total_precipitation_or_total_water_equivalent",
+    "wind_speed",
+    "maximum_wind_gust_speed",
+    "pressure_reduced_to_mean_sea_level"
+  ]
+}
